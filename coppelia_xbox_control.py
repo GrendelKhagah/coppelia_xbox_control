@@ -28,6 +28,11 @@
 #   - a "/Quadcopter/light" object for light toggle
 #   - a "/Quadcopter/altimeter" proximity sensor pointing down
 #   - a "/Quadcopter/frontSensor" proximity sensor pointing forward
+#   - (optional) triangle proximity sensors:
+#       - "/Quadcopter/leftTriSensor" pointing left
+#       - "/Quadcopter/rightTriSensor" pointing right
+#       - "/Quadcopter/frontleftTriSensor" pointing front-left
+#       - "/Quadcopter/frontrightTriSensor" pointing front-right
 #
 # Crash logs:
 #   ~/Desktop/logs/controller_crash.log  (fallback: ./logs/controller_crash.log)
@@ -100,6 +105,10 @@ class Tuning:
     ground_margin_m: float = 0.35  # block descent if closer than this to ground
     slow_dist_m: float = 0.8       # start slowing forward motion at this distance
     stop_dist_m: float = 0.3       # stop forward motion at/inside this distance
+    # Triangle sensor tuning
+    tri_side_slow_dist_m: float = 0.8   # start slowing strafes at this distance
+    tri_side_stop_dist_m: float = 0.3   # stop strafes at/inside this distance
+    tri_front_stop_dist_m: float = 0.35 # stop forward motion when front-tri sensors report <= this
 
     # Logging/verbosity
     verbose_console: bool = True   # keep calibration prompts + periodic prints
@@ -135,6 +144,15 @@ class SensorCache:
     front_dist: float = float("inf")
     alt_hit: bool = False
     alt_dist: float = float("inf")
+    # triangle sensors (new)
+    left_tri_hit: bool = False
+    left_tri_dist: float = float("inf")
+    right_tri_hit: bool = False
+    right_tri_dist: float = float("inf")
+    front_left_tri_hit: bool = False
+    front_left_tri_dist: float = float("inf")
+    front_right_tri_hit: bool = False
+    front_right_tri_dist: float = float("inf")
     accum_s: float = 0.0
 
 
@@ -145,6 +163,11 @@ class Handles:
     light: int
     alt_sensor: int
     front_sensor: int
+    # triangle sensors
+    left_tri_sensor: int
+    right_tri_sensor: int
+    front_left_tri_sensor: int
+    front_right_tri_sensor: int
 
 
 @dataclass
@@ -409,6 +432,11 @@ HANDLE_CANDIDATES: Dict[str, Tuple[str, ...]] = {
     "light": ("/Quadcopter/light", "/light"),
     "alt_sensor": ("/Quadcopter/altimeter", "/Quadcopter/altSensor", "/altimeter"),
     "front_sensor": ("/Quadcopter/frontSensor", "/Quadcopter/front", "/frontSensor"),
+    # NEW triangle sensors (common naming variants)
+    "left_tri_sensor": ("/Quadcopter/leftTriSensor", "/leftTriSensor"),
+    "right_tri_sensor": ("/Quadcopter/rightTriSensor", "/rightTriSensor"),
+    "front_left_tri_sensor": ("/Quadcopter/frontleftTriSensor", "/Quadcopter/frontLeftTriSensor", "/frontleftTriSensor", "/frontLeftTriSensor"),
+    "front_right_tri_sensor": ("/Quadcopter/frontrightTriSensor", "/Quadcopter/frontRightTriSensor", "/frontrightTriSensor", "/frontRightTriSensor"),
 }
 
 
@@ -417,8 +445,23 @@ def connect_all() -> Tuple[Any, Handles]:
     sim = connect_sim()
 
     resolved: Dict[str, int] = {}
+    # Required handles (must exist)
+    required = {"target", "base", "light", "alt_sensor", "front_sensor"}
+    # Optional triangle sensors (best-effort)
+    optional = {"left_tri_sensor", "right_tri_sensor", "front_left_tri_sensor", "front_right_tri_sensor"}
+
     for name, paths in HANDLE_CANDIDATES.items():
-        resolved[name] = require_one(sim, paths)
+        if name in required:
+            resolved[name] = require_one(sim, paths)
+        elif name in optional:
+            try:
+                resolved[name] = require_one(sim, paths)
+            except Exception:
+                # missing optional sensor -> mark as absent
+                resolved[name] = None
+        else:
+            # default behavior: try and require
+            resolved[name] = require_one(sim, paths)
 
     handles = Handles(
         target=resolved["target"],
@@ -426,6 +469,10 @@ def connect_all() -> Tuple[Any, Handles]:
         light=resolved["light"],
         alt_sensor=resolved["alt_sensor"],
         front_sensor=resolved["front_sensor"],
+        left_tri_sensor=int(resolved.get("left_tri_sensor") or -1),
+        right_tri_sensor=int(resolved.get("right_tri_sensor") or -1),
+        front_left_tri_sensor=int(resolved.get("front_left_tri_sensor") or -1),
+        front_right_tri_sensor=int(resolved.get("front_right_tri_sensor") or -1),
     )
     return sim, handles
 
@@ -536,6 +583,7 @@ def calibrate_right_stick_axes(joy: pygame.joystick.Joystick) -> Tuple[int, int]
     yaw_axis = max(rs_axes, key=lambda a: peaks_right[a])
     alt_axis = rs_axes[0] if rs_axes[1] == yaw_axis else rs_axes[1]
 
+
     # Sanity: altitude should respond more to UP flick
     if peaks_up[alt_axis] < peaks_up[yaw_axis]:
         alt_axis = max(rs_axes, key=lambda a: peaks_up[a])
@@ -632,6 +680,41 @@ def apply_front_obstacle_brake(
         return forward_cmd * scale
 
     return forward_cmd
+
+
+def apply_side_obstacle_brake(
+    strafe_cmd: float,
+    left_hit: bool,
+    left_dist: float,
+    right_hit: bool,
+    right_dist: float,
+    slow_dist: float,
+    stop_dist: float,
+) -> float:
+    """
+    Brake strafing based on side sensors.
+    - If strafing left (strafe_cmd < 0) and left sensor hits: scale/stop.
+    - If strafing right (strafe_cmd > 0) and right sensor hits: scale/stop.
+    """
+    # Left side
+    if strafe_cmd < 0 and left_hit:
+        if left_dist <= stop_dist:
+            return 0.0
+        if left_dist < slow_dist:
+            scale = (left_dist - stop_dist) / max((slow_dist - stop_dist), K.SENSOR_POLL_JITTER_EPS)
+            scale = clamp(scale, 0.0, 1.0)
+            return strafe_cmd * scale
+
+    # Right side
+    if strafe_cmd > 0 and right_hit:
+        if right_dist <= stop_dist:
+            return 0.0
+        if right_dist < slow_dist:
+            scale = (right_dist - stop_dist) / max((slow_dist - stop_dist), K.SENSOR_POLL_JITTER_EPS)
+            scale = clamp(scale, 0.0, 1.0)
+            return strafe_cmd * scale
+
+    return strafe_cmd
 
 
 def apply_ground_margin(climb_cmd: float, alt_hit: bool, alt_dist: float, margin: float) -> float:
@@ -792,6 +875,23 @@ def configure_sim_sensors(sim: Any, handles: Handles) -> None:
     try:
         sim_call(sim.setExplicitHandling, handles.alt_sensor, 0)
         sim_call(sim.setExplicitHandling, handles.front_sensor, 0)
+        # triangle sensors: best-effort explicit handling disable
+        try:
+            sim_call(sim.setExplicitHandling, handles.left_tri_sensor, 0)
+        except Exception:
+            pass
+        try:
+            sim_call(sim.setExplicitHandling, handles.right_tri_sensor, 0)
+        except Exception:
+            pass
+        try:
+            sim_call(sim.setExplicitHandling, handles.front_left_tri_sensor, 0)
+        except Exception:
+            pass
+        try:
+            sim_call(sim.setExplicitHandling, handles.front_right_tri_sensor, 0)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -812,6 +912,26 @@ def maybe_poll_sensors(sim: Any, handles: Handles, state: LoopState, dt: float) 
     state.sensors.accum_s = 0.0
     state.sensors.alt_hit, state.sensors.alt_dist = read_proximity(sim, handles.alt_sensor)
     state.sensors.front_hit, state.sensors.front_dist = read_proximity(sim, handles.front_sensor)
+    # triangle sensors (best-effort, scenes may not have them)
+    try:
+        state.sensors.left_tri_hit, state.sensors.left_tri_dist = read_proximity(sim, handles.left_tri_sensor)
+    except Exception:
+        state.sensors.left_tri_hit, state.sensors.left_tri_dist = False, float("inf")
+
+    try:
+        state.sensors.right_tri_hit, state.sensors.right_tri_dist = read_proximity(sim, handles.right_tri_sensor)
+    except Exception:
+        state.sensors.right_tri_hit, state.sensors.right_tri_dist = False, float("inf")
+
+    try:
+        state.sensors.front_left_tri_hit, state.sensors.front_left_tri_dist = read_proximity(sim, handles.front_left_tri_sensor)
+    except Exception:
+        state.sensors.front_left_tri_hit, state.sensors.front_left_tri_dist = False, float("inf")
+
+    try:
+        state.sensors.front_right_tri_hit, state.sensors.front_right_tri_dist = read_proximity(sim, handles.front_right_tri_sensor)
+    except Exception:
+        state.sensors.front_right_tri_hit, state.sensors.front_right_tri_dist = False, float("inf")
 
 
 def update_target(sim: Any, handles: Handles, state: LoopState, axis_map: AxisMapping, joy: pygame.joystick.Joystick, dt: float) -> Tuple[float, float, float, float]:
@@ -834,6 +954,26 @@ def update_target(sim: Any, handles: Handles, state: LoopState, axis_map: AxisMa
         state.sensors.front_hit, state.sensors.front_dist,
         CFG.slow_dist_m, CFG.stop_dist_m
     )
+    # Side strafing brakes from triangle sensors
+    strafe_cmd = apply_side_obstacle_brake(
+        strafe_cmd,
+        state.sensors.left_tri_hit, state.sensors.left_tri_dist,
+        state.sensors.right_tri_hit, state.sensors.right_tri_dist,
+        CFG.tri_side_slow_dist_m, CFG.tri_side_stop_dist_m,
+    )
+
+    # Front-left / front-right triangle sensors: immediate stop forward if triggered within threshold
+    try:
+        fl_block = state.sensors.front_left_tri_hit and (state.sensors.front_left_tri_dist <= CFG.tri_front_stop_dist_m)
+    except Exception:
+        fl_block = False
+    try:
+        fr_block = state.sensors.front_right_tri_hit and (state.sensors.front_right_tri_dist <= CFG.tri_front_stop_dist_m)
+    except Exception:
+        fr_block = False
+
+    if (fl_block or fr_block) and forward_cmd > 0:
+        forward_cmd = 0.0
     climb_cmd = apply_ground_margin(
         climb_cmd,
         state.sensors.alt_hit, state.sensors.alt_dist,
@@ -880,7 +1020,11 @@ def print_debug(state: LoopState, axes: Tuple[float, float, float, float]) -> No
     print(
         f"axes: lx={lx:+.2f} ly={ly:+.2f} yaw(rx)={rx:+.2f} alt(ry)={ry:+.2f} | "
         f"front: hit={int(state.sensors.front_hit)} d={state.sensors.front_dist if state.sensors.front_hit else -1:.2f} | "
-        f"alt: hit={int(state.sensors.alt_hit)} d={state.sensors.alt_dist if state.sensors.alt_hit else -1:.2f}"
+        f"alt: hit={int(state.sensors.alt_hit)} d={state.sensors.alt_dist if state.sensors.alt_hit else -1:.2f} | "
+        f"Ltri: hit={int(state.sensors.left_tri_hit)} d={state.sensors.left_tri_dist if state.sensors.left_tri_hit else -1:.2f} | "
+        f"Rtri: hit={int(state.sensors.right_tri_hit)} d={state.sensors.right_tri_dist if state.sensors.right_tri_hit else -1:.2f} | "
+        f"FLtri: hit={int(state.sensors.front_left_tri_hit)} d={state.sensors.front_left_tri_dist if state.sensors.front_left_tri_hit else -1:.2f} | "
+        f"FRtri: hit={int(state.sensors.front_right_tri_hit)} d={state.sensors.front_right_tri_dist if state.sensors.front_right_tri_hit else -1:.2f}"
     )
 
 # =========================
